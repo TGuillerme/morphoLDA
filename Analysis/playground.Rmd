@@ -130,5 +130,7 @@ x <- model.matrix(Salary~.-1, data = Hitters)
 y <- Hitters$Salary
 
 fit_ridge <- glmnet(x, y, alpha = 0) # Ridge
+cv_ridge <- cv.glmnet(x, y, alpha = 0) # Cross validation
+
 fit_lasso <- glmnet(x, y, alpha = 1) # Lasso
 ```
