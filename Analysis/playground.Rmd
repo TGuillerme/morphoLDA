@@ -8,7 +8,10 @@ output:
     fig_height: 6
 ---
 
-Playing around with LDA and geomorph data
+Playing around with LDA and geomorph data.
+The idea is to get statistically correct pipeline to:
+ * Quantify grouping hypothesis knowing traits (e.g. we have three diet groups and we want to measure how "real" they are: groups with high predictability are better reflected in the morphospace than others)
+ * ...?
 
 # Packages and data
 
@@ -19,6 +22,7 @@ library(ape)
 library(geomorph)
 library(MASS)
 library(glmnet)
+set.seed(42)
 ```
 
 ## Data
@@ -54,9 +58,9 @@ procrustes_matrix <- geomorph::two.d.array(procrustes$coords)
 morphospace <- prcomp(procrustes_matrix)
 ```
 
-We can then plot the PCA using the following plotting function (recycled below):
+We can then plot the PCA using the a plot morphospace function (see un-compiled Rmd for details):
 
-```{r}
+```{r, echo = FALSE}
 ## Plotting PCA function
 #@param ordination is the PCA
 #@param classifier is a list of different groups rows IDs to plot
@@ -103,40 +107,250 @@ classifier <- list("Jord" = Jord_sp, "Teyah" = Teyah_sp)
 plot.pca(morphospace, classifier = classifier, cols = c("orange", "blue"), main = "Tips only")
 ```
 
+From the PCA, we can make three classifiers with some expectation on how they'll perform in terms of classifications
+
+ * the morphotypes (the three clusters) that should perform well
+ * the species (blue or orange) that should perform semi-well
+ * three random groups that should perform badly
+
+```{r}
+## Species classifier
+species_class <- unlist(lapply(strsplit(rownames(procrustes_matrix), split = "_"),
+                               function(x) return(x[1])))
+
+## Morpho_groups classifier
+morpho_class <- c(rep("group1", 10), rep("group2", 10), rep("group3", 20))
+
+## Random classifier
+random_class <- sample(c("random1", "random2", "random3"), 40, replace = TRUE)
+```
 
 ## LDA
 
-```{r}
-## SP classifier
-test_sp <- data.frame(procrustes_matrix,
-                      Sp = unlist(lapply(strsplit(rownames(procrustes_matrix), split = "_"),
-                        function(x) return(x[1]))))
-
-
-## Also add a fake (PCA) classifier
-
-Iris <- data.frame(rbind(iris3[,,1], iris3[,,2], iris3[,,3]),
-                   Sp = rep(c("s","c","v"), rep(50,3)))
-train <- sample(1:150, 75)
-table(Iris$Sp[train])
-## your answer may differ
-##  c  s  v
-## 22 23 30
-z <- MASS::lda(Sp ~ ., Iris, prior = c(1,1,1)/3, subset = train)
-predict(z, Iris[-train, ])$class
-##  [1] s s s s s s s s s s s s s s s s s s s s s s s s s s s c c c
-## [31] c c c c c c c v c c c c v c c c c c c c c c c c c v v v v v
-## [61] v v v v v v v v v v v v v v v
-(z1 <- update(z, . ~ . - Petal.W.))
+We can first apply a naive LDA approach as a classification problem (similarly to Fisher's Iris dataset) and see how well can we differentiate groups knowing our a priori classifiers.
 
 
 
+Couple of points for the LDA:
+
+ * Do we need a "bootstrap" style procedure since every training dataset can vary?
+ * How to measure accuracy? Ratio correct/incorrects? Or correct/total?
+ * Do we need to scale the accuracy if groups widely differ in size? I.e. scaling by the observed proportions)
+
+
+
+```{r, echo = FALSE}
+## Running a LDA
+#@param data A data.frame with one classifier as the last column
+#@param subset The size of the training subset
+#@param prior The grouping prior information (if left empty, proportions of the training set are used)
+#@param CV Whether to perform cross validation (default = FALSE)
+#@param ... are passed to MASS::lda()
+run.LDA <- function(data, subset, prior, CV = FALSE, ...) {
+
+    #TODO: Add the option to update models
+
+    ## First we select a subset of the dataset for training
+    subset <- sample(1:nrow(data), subset)
+    training <- data[subset, ncol(data)]
+
+    ## Get the number classes from the data
+    classes <- unique(data[, ncol(data)])
+
+    ## Second we set the prior
+    if(missing(prior)) {
+        prior <- as.numeric((table(training)/sum(table(training))))
+    }
+
+    ## Fitting the LDA
+    lda_fit <- MASS::lda(x = data[, -ncol(data)], grouping = data[, ncol(data)],
+                         prior = prior, subset = subset, CV = CV, ...)
+
+    ## Predicting the fit
+    lda_predict <- predict(lda_fit, data[-subset, -ncol(data)])
+
+    ## Return the predictions results and the fit
+    return(list("fit" = lda_fit, "predict" = lda_predict, "training" = subset, "data" = data))
+
+}
+## Running a LDA
+#@param data Output from run.LDA
+    #@param scale.accuracy Whether to scale the accuracy or not (divided it by the observed proportions, default = TRUE)
+#@param plot Whether to plot the predictions (default = TRUE)
+#@param legend whether to plot the legend (default = TRUE)
+#@param leg.pos if legend = TRUE, the legend position (default = "topright")
+#@param ... can be recycled to plot (for col, xlab, xlim, ylab, ylim and main only)
+
+summarise.predictions <- function(data, ..., plot = TRUE, legend = TRUE, leg.pos = "topright") {
+
+    ## dots arguments
+    dots <- list(...)
+
+    ## Get the classes
+    classes <- levels(data$data[, ncol(data$data)])
+
+    ## Handle the optional arguments
+    if(plot) {
+        if(is.null(dots$col)) {
+            dots$col <- grDevices::gray.colors(3)
+        }
+        if(is.null(dots$xlab)) {
+            dots$xlab <- "Classes"
+        }
+        if(is.null(dots$ylab)) {
+            dots$ylab <- "Proportional attributions"
+        }
+        if(is.null(dots$xlim)) {
+            dots$xlim <- c(1:length(classes))
+        }
+        if(is.null(dots$ylim)) {
+            dots$ylim <- c(0,1)
+        }
+    }
+
+    ## Get the attribution table
+    attribution_table <- table(data$predict$class, data$data[-data$training, ncol(data$data)])
+
+    # ## Get the prediction accuracy
+    # get.accuracy <- function(data, attribution_table, scale = scale.accuracy) {
+    #     if(!scale) {
+    #         ## Return the average number of correct predictions
+    #         return(sum(diag(attribution_table))/sum(attribution_table))
+    #     } else {
+    #         ## Return the number of scaled correct predictions
+    #         obs_class_proportion <- table(data$data[, ncol(data$data)])
+    #         obs_class_proportion <- obs_class_proportion/sum(obs_class_proportion)
+
+    #         obs_class_proportion <- c(0.333, 0.333, 0.333)            
+
+    #         sum(diag(attribution_table)/obs_class_proportion)
+
+    #         /(sum(attribution_table))
+
+    #         sum(attribution_table*obs_class_proportion)
+
+    #         test <- table(data$predict$class, data$data[-data$training, ncol(data$data)])
+
+    #         sum(diag(attribution_table))/sum(attribution_table)
+
+    #         predict_rand1 <- which(data$predict$class == "random1")
+    #         (data$predict$class[predict_rand1] == data$data[-data$training, ncol(data$data)][predict_rand1])
+    #     }
+    # }
+
+    prediction_accuracy <- mean(data$predict$class == data$data[-data$training, ncol(data$data)])
+
+    if(plot) {
+        ## Get list of posteriors
+        posteriors <- data.frame(data$predict)
+
+        ## Get the proportion of right classification per class
+        ## Get one list of proportions
+        get.proportions <- function(class_ID, posteriors, classes) {
+            proportion <- apply(posteriors[which(posteriors$class == classes[class_ID]),
+                                2:(length(classes)+1)], 2, mean)
+            names(proportion) <- paste0("post.", classes)
+            return(proportion)
+        }
+
+        ## Get the proportion for each posterior
+        proportions <- lapply(as.list(1:length(classes)), get.proportions, posteriors, classes)
+        names(proportions) <- classes
+
+        ## Adding the accuracy to the main
+        main_accuracy <- paste0("Accuracy = ", round(prediction_accuracy*100, 2), "%")
+        
+        #TG: TODO Make the plot addling more flexible
+        if(!is.null(dots$main)) {
+            dots$main <- paste0(dots$main, " (", main_accuracy, ")")
+        } else {
+            dots$main <- main_accuracy
+        }
+
+        ## Plotting the proportions
+        plot_table <- as.matrix(data.frame(proportions))
+
+        barplot(plot_table, main = dots$main, col = dots$col, xlab = dots$xlab, ylab = dots$ylab,
+                ylim = dots$ylim, beside = FALSE)
+        
+        if(legend) {
+            legend(x = leg.pos, legend = classes, col = dots$col, pch = 15, bg = "white")
+        }
+
+    
+    } else {
+
+        ## Return the attribution table
+        return(list("attribution" = attribution_table, "accuracy" = prediction_accuracy))
+    }
+}
 ```
 
+We can quickly test that on the Iris dataset:
+
+```{r, fig.height = 6, fig.width = 6}
+## The Iris dataset + species
+iris_sp <- data.frame(rbind(iris3[,,1], iris3[,,2], iris3[,,3]),
+                      Sp = rep(c("s","c","v"), rep(50,3)))
+
+## Running the LDA pipeline
+lda_results <- run.LDA(iris_sp, subset = 50)
+
+## Plotting the prediction results
+summarise.predictions(lda_results, main = "Iris test", col = c("blue", "orange", "darkgreen"))
+```
+
+Fisher knew what he was doing...
+
+### LDA on geomorph data?
+
+We can now apply it on the plethodon dataset and rank our predictors:
+
+
+```{r, fig.height = 6, fig.width = 6}
+## For the species
+data_species <- data.frame(procrustes_matrix, species = species_class)
+
+## Running the LDA pipeline (with a prediction set of half the species)
+lda_species <- run.LDA(data_species, subset = 20)
+
+## Plotting the results
+summarise.predictions(lda_species, main = "Species", col = c("blue", "orange"))
+```
+
+The accuracy is not that good (60%) but that's expected from the dataset.
+
+
+```{r, fig.height = 6, fig.width = 6}
+## For the morphogroups
+data_morpho <- data.frame(procrustes_matrix, species = morpho_class)
+
+## Running the LDA pipeline (with a prediction set of half the species)
+lda_morpho <- run.LDA(data_morpho, subset = 20)
+
+## Plotting the results
+summarise.predictions(lda_morpho, main = "Morphogroups", col = c("blue", "orange", "darkgreen"))
+```
+
+This group has a slightly better accuracy
+
+
+```{r, fig.height = 6, fig.width = 6}
+## For the random groups
+data_random <- data.frame(procrustes_matrix, species = random_class)
+
+## Running the LDA pipeline (with a prediction set of half the species)
+lda_random <- run.LDA(data_random, subset = 20)
+
+## Plotting the results
+summarise.predictions(lda_random, main = "Random", col = c("blue", "orange", "darkgreen"))
+```
+
+And this one is as shitty as expected!
 
 ## Lasso
 
-```{r}
+```{r, eval = FALSE}
 library(glmnet)
 x <- model.matrix(Salary~.-1, data = Hitters)
 y <- Hitters$Salary
